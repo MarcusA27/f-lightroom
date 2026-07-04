@@ -39,6 +39,16 @@ struct LumenApp: App {
         .defaultSize(width: 920, height: 750)
         .windowStyle(.titleBar)
         .commands {
+            CommandGroup(replacing: .undoRedo) {
+                Button("Undo") {
+                    NotificationCenter.default.post(name: .undoEdit, object: nil)
+                }
+                .keyboardShortcut("z", modifiers: .command)
+                Button("Redo") {
+                    NotificationCenter.default.post(name: .redoEdit, object: nil)
+                }
+                .keyboardShortcut("z", modifiers: [.command, .shift])
+            }
             CommandGroup(replacing: .newItem) {
                 Button("Open Folder…") {
                     NotificationCenter.default.post(name: .chooseFolder, object: nil)
@@ -60,6 +70,14 @@ struct LumenApp: App {
                     NotificationCenter.default.post(name: .rotateRight, object: nil)
                 }
                 .keyboardShortcut("r", modifiers: [])
+                Button("Crop") {
+                    NotificationCenter.default.post(name: .cropToggle, object: nil)
+                }
+                .keyboardShortcut("c", modifiers: [])
+                Button("Describe Vision…") {
+                    NotificationCenter.default.post(name: .describeVision, object: nil)
+                }
+                .keyboardShortcut("d", modifiers: [.command, .shift])
             }
         }
     }
