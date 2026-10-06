@@ -1098,24 +1098,36 @@ func applyAdjustments(_ image: NSImage, _ a: Adjustments) -> NSImage? {
     if a.exposure != 0 {
         apply("CIExposureAdjust", [kCIInputEVKey: a.exposure * 0.02])
     }
-    // One parametric tone curve carries all four region/endpoint controls, with
-    // the midpoint pinned at (0.5, 0.5). The pin keeps each slider surgical:
-    // Blacks bends only the low end, Whites only the high end, Shadows/Highlights
-    // the quarter tones — none of them drag the midtones or scale the whole range.
-    if a.shadows != 0 || a.highlights != 0 || a.whites != 0 || a.blacks != 0 {
+    // Highlights (recovery) and Shadows are adaptive, edge-aware local tone mapping,
+    // like Lightroom's: they find the actual bright/dark regions instead of bending
+    // a fixed luminance band. inputHighlightAmount only darkens (1→0.3), so it
+    // carries highlight *recovery* (negative); brightening rides the curve below.
+    // inputShadowAmount lifts (+) or deepens (−) shadows both ways.
+    if a.shadows != 0 || a.highlights < 0 {
+        apply("CIHighlightShadowAdjust", [
+            kCIInputRadiusKey: 2.0,
+            "inputShadowAmount": max(-1, min(1, a.shadows / 100)),
+            "inputHighlightAmount": a.highlights < 0 ? max(0.3, 1 + a.highlights / 100 * 0.7) : 1.0
+        ])
+    }
+    // One tone curve carries the endpoint/clipping controls (Whites, Blacks) plus a
+    // real sigmoid Contrast — quarter-tone pushed down, three-quarter up, around the
+    // pinned midtone — plus positive-Highlights brightening. The pin keeps Whites/
+    // Blacks surgical; the clamps keep the curve monotonic at extreme combinations.
+    if a.whites != 0 || a.blacks != 0 || a.contrast != 0 || a.highlights > 0 {
+        let c = a.contrast / 100
+        let p1y = max(0.05, 0.25 - c * 0.12)
+        let p3y = min(0.95, 0.75 + c * 0.12 + max(0, a.highlights) / 100 * 0.2)
         apply("CIToneCurve", [
             "inputPoint0": CIVector(x: 0, y: a.blacks / 100 * 0.2),
-            "inputPoint1": CIVector(x: 0.25, y: 0.25 + a.shadows / 100 * 0.2 + a.blacks / 100 * 0.12),
+            "inputPoint1": CIVector(x: 0.25, y: p1y),
             "inputPoint2": CIVector(x: 0.5, y: 0.5),
-            "inputPoint3": CIVector(x: 0.75, y: 0.75 + a.highlights / 100 * 0.2),
+            "inputPoint3": CIVector(x: 0.75, y: p3y),
             "inputPoint4": CIVector(x: 1, y: 1 + a.whites / 100 * 0.2)
         ])
     }
-    if a.contrast != 0 || a.saturation != 0 {
-        apply("CIColorControls", [
-            kCIInputContrastKey: 1 + a.contrast / 100 * 0.3,
-            kCIInputSaturationKey: 1 + a.saturation / 100
-        ])
+    if a.saturation != 0 {
+        apply("CIColorControls", [kCIInputSaturationKey: 1 + a.saturation / 100])
     }
     // Vibrance: nonlinear saturation that spares already-saturated colors and skin.
     if a.vibrance != 0 {
@@ -1225,6 +1237,11 @@ struct ScrubRow: View {
     @State private var dragging = false
     @State private var physTimer: Timer?
     @State private var homeArmed = true
+    // Comet: per-tick "heat" in width-fraction space (0…1 across the track). The
+    // handle reheats the cells beneath it each frame; every cell decays, leaving a
+    // glowing wake. Fixed resolution so it's independent of the track's pixel width.
+    @State private var heat: [Double] = Array(repeating: 0, count: 96)
+    @State private var idleCommitted = true
 
     static let intFormat: (Double) -> String = { v in
         v == 0 ? "0" : (v > 0 ? "+\(Int(v))" : "\(Int(v))")
@@ -1273,17 +1290,43 @@ struct ScrubRow: View {
         // Stretch spikes with speed, then relaxes — the taffy pull on fast flicks.
         let speed = min(1, CGFloat(abs(value - prev)) / 4)
         stretch = max(speed, stretch * 0.85)
+
+        // Comet: cool every cell, then reheat the handle's wake while dragging.
+        var h = heat
+        for i in h.indices { h[i] *= 0.86 }
+        if dragging {
+            let f = (value - range.lowerBound) / (range.upperBound - range.lowerBound)
+            let c = f * Double(h.count - 1)
+            let peak = min(1.0, 0.5 + Double(stretch) * 0.7)
+            let ci = Int(c.rounded())
+            for j in max(0, ci - 2)...min(h.count - 1, ci + 2) {
+                let dd = Double(j) - c
+                h[j] = max(h[j], peak * exp(-(dd * dd) / 2.0))
+            }
+        }
+        heat = h
+        let hot = h.max() ?? 0
+
         detent(prev: prev, now: value)
 
+        // Value has come to rest: commit the final render once, then keep the loop
+        // alive only long enough for the comet trail to fade to cold.
         if !dragging && abs(target - value) < 0.03 && abs(vel) < 0.03 {
             value = target
             vel = 0
             stretch = 0
-            physTimer?.invalidate(); physTimer = nil
-            grab = 0
-            onEditingChanged(false)
+            if !idleCommitted {
+                idleCommitted = true
+                grab = 0
+                onEditingChanged(false)
+            }
+            if hot < 0.02 {
+                heat = Array(repeating: 0, count: h.count)
+                physTimer?.invalidate(); physTimer = nil
+            }
             return
         }
+        idleCommitted = false
         if value != prev { onEditingChanged(true) }
     }
 
@@ -1315,6 +1358,7 @@ struct ScrubRow: View {
 
             Canvas { ctx, size in
                 let w = size.width, h = size.height
+                if w < 1 { return }
                 let span = range.upperBound - range.lowerBound
                 let cx = CGFloat((0 - range.lowerBound) / span) * w
                 let vx = CGFloat((value - range.lowerBound) / span) * w
@@ -1325,28 +1369,24 @@ struct ScrubRow: View {
                 let spacing: CGFloat = 7
                 let count = max(2, Int(w / spacing))
                 let margin = (w - CGFloat(count) * spacing) / 2
-                // While dragging, a soft lens rides the handle: nearby ticks swell
-                // taller, fatten, and bloom into the fill color, tapering off with
-                // distance. `grab` gates it so the ruler stays flat at rest.
-                let sigma = Double(spacing) * 2.3
+                let cells = heat.count
                 for i in 0...count {
                     let tx = margin + CGFloat(i) * spacing
                     let inSpan = tx >= min(cx, vx) - 0.5 && tx <= max(cx, vx) + 0.5
-                    let d = Double(tx - vx)
-                    let bump = exp(-(d * d) / (2 * sigma * sigma)) * Double(grab)
-                    let th = tickH * (1 + bump * 0.5)
-                    let width = 1.4 + bump * 0.7
+                    // Comet heat: the glowing wake the handle leaves behind. Each
+                    // tick reads its cell, riding taller and hotter the fresher it is.
+                    let cell = min(cells - 1, max(0, Int((tx / w) * CGFloat(cells - 1))))
+                    let heatV = CGFloat(heat[cell])
+                    let th = tickH * (1 + heatV * 0.7)
+                    let width = 1.4 + heatV * 1.0
                     var p = Path()
                     p.move(to: CGPoint(x: tx, y: baseY - th / 2))
                     p.addLine(to: CGPoint(x: tx, y: baseY + th / 2))
-                    // Cold base grid, then the warm fill blooming on the ticks the
-                    // slider spans plus a lens around the handle.
+                    // Cold base grid, then the warm fill — the resting span from
+                    // center to handle, plus the comet trail glowing over it.
                     ctx.stroke(p, with: .color(.primary.opacity(0.16)),
                                style: StrokeStyle(lineWidth: width, lineCap: .round))
-                    // Span fill needs a live value; the lens rides the handle even
-                    // through 0, so it isn't gated on `active` (avoids a gray flash
-                    // while crossing center).
-                    let warmth = max(active && inSpan ? 0.9 : 0, bump * 0.95)
+                    let warmth = max(active && inSpan ? 0.85 : 0, Double(heatV) * 0.95)
                     if warmth > 0 {
                         ctx.stroke(p, with: .color(fill.opacity(warmth)),
                                    style: StrokeStyle(lineWidth: width, lineCap: .round))
@@ -1384,6 +1424,7 @@ struct ScrubRow: View {
                         target = snapped(fraction: f)
                         grab = 1
                         dragging = true
+                        idleCommitted = false
                         startPhysics()
                     },
                     onEnded: {
@@ -1393,6 +1434,7 @@ struct ScrubRow: View {
                     onReset: {
                         target = 0
                         dragging = false
+                        idleCommitted = false
                         startPhysics()
                     }
                 )
